@@ -2,11 +2,11 @@ use std::{fs::File, path::Path};
 
 use crate::error::Result;
 
-pub fn fetch_binary(name: &str, dir: &Path, url: &str) -> Result<()> {
+pub fn fetch_binary(path: &Path, url: &str) -> Result<()> {
     let resp = ureq::get(url).call()?;
     let mut reader = resp.into_reader();
 
-    let mut file = File::create(dir.join(name))?;
+    let mut file = File::create(path)?;
     std::io::copy(&mut reader, &mut file)?;
 
     Ok(())

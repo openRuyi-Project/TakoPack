@@ -1,141 +1,73 @@
-use std::path::Path;
+use std::{
+    cell::OnceCell,
+    path::{Path, PathBuf},
+};
 
-use takopack_core::{error::Error as CoreError, network::fetch_jsonl, tarball::extract_tar_gz};
+use crate::cargo::source::{
+    CargoSource, SourceArchive,
+    crates_io::{builder::CrateInfo, error},
+};
 
-use crate::cargo::source::crates_io::{error::Error, prepared::PreparedCrate};
-
+#[derive(Debug)]
 pub struct FromCratesIo {
-    name: String,
-    version: Option<String>,
+    info: CrateInfo,
+
+    archive: OnceCell<SourceArchive>,
+    cargo_toml_path: OnceCell<PathBuf>,
 }
 
 impl FromCratesIo {
-    pub fn new(name: String) -> Self {
+    pub fn new(info: CrateInfo) -> Self {
         Self {
-            name,
-            version: None,
+            info,
+            archive: OnceCell::new(),
+            cargo_toml_path: OnceCell::new(),
+        }
+    }
+}
+
+impl CargoSource for FromCratesIo {
+    type Error = error::Error;
+
+    fn load_archive(
+        &self,
+        dir: &impl AsRef<std::path::Path>,
+    ) -> Result<&SourceArchive, Self::Error> {
+        // Here we can use get_or_try_init, which is a nightly feature now.
+        if let Some(archive) = self.archive.get() {
+            Ok(archive)
+        } else {
+            // {name}-{version}.crate
+            let filename = self.id().to_owned() + ".crate";
+            // <path>/{name}-{version}.crate
+            let path = dir.as_ref().join(&filename);
+            let url = format!(
+                "https://static.crates.io/crates/{}/{}",
+                self.name(),
+                filename
+            );
+
+            takopack_core::network::fetch_binary(&path, &url)?;
+
+            let archive = SourceArchive::try_new_hashchecked(&path, &url, &self.info.cksum)?;
+            self.archive.set(archive).unwrap();
+            self.load_archive(dir)
         }
     }
 
-    pub fn version(&mut self, version: String) -> &mut Self {
-        self.version = Some(version);
-        self
+    //     fn load_cargo_dir(&self, dir: &impl AsRef<std::path::Path>) -> Result<&Path, Self::Error> {
+    //         let archive_path = self.load_archive(dir);
+    //
+    //         takopack_core::tarball::extract_tar_gz(&archive, &dir)?;
+    //
+    //         todo!()
+    //     }
+
+    fn name(&self) -> &str {
+        &self.info.name
     }
 
-    pub fn latest(&mut self) -> Result<&mut Self, Error> {
-        let mut data_from_sprase_index = fetch_data_from_sprase_index(&self.name)?
-            .into_iter()
-            .filter(|info| !info.yanked);
-
-        let crate_info = match self.version.as_deref() {
-            Some(v) => data_from_sprase_index
-                .find(|c: &CrateInfo| c.vers == v) // We believe crates.io gives no duplicated version.
-                .ok_or_else(|| Error::VersionNotFound {
-                    name: self.name.to_owned(),
-                    version: v.to_owned(),
-                }),
-            // Assume that the last one crateinfo matches the latest version.
-            None => data_from_sprase_index
-                .last()
-                .ok_or_else(|| Error::CrateNotFound {
-                    name: self.name.to_owned(),
-                }),
-        }?;
-
-        Ok(self.version(crate_info.vers))
-    }
-
-    pub fn prepare(&mut self, base_dir: impl AsRef<Path>) -> Result<PreparedCrate, Error> {
-        let base_dir = base_dir.as_ref();
-
-        let name = self.name.clone();
-        let version = self.version.clone().ok_or(Error::VersionNotSet)?;
-        let id = format!("{}-{}", &name, &version);
-
-        let filename = id.to_owned() + ".crate";
-
-        takopack_core::network::fetch_binary(
-            &filename,
-            &base_dir,
-            &format!("https://static.crates.io/crates/{}/{}", self.name, filename),
-        )?;
-
-        let archive = base_dir.join(&filename);
-        let extract_dir = base_dir.join(&id);
-
-        extract_tar_gz(&archive, &extract_dir)?;
-
-        Ok(PreparedCrate::new(
-            name,
-            version,
-            archive,
-            extract_dir.join(&id),
-        ))
-    }
-}
-
-fn fetch_data_from_sprase_index(name: &str) -> Result<Vec<CrateInfo>, Error> {
-    let url = sprase_index_url(name);
-
-    match fetch_jsonl(&url) {
-        Ok(v) => Ok(v),
-        Err(CoreError::Network(ureq::Error::Status(404, _))) => Err(Error::CrateNotFound {
-            name: name.to_owned(),
-        }),
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn sprase_index_url(name: &str) -> String {
-    let len = name.len();
-    let first_part = match len {
-        0 => unreachable!(),
-        1 => "1",
-        2 => "2",
-        3 => "3",
-        _ => &name[0..=1],
-    };
-    let second_part = match len {
-        0 => unreachable!(),
-        1 => &name,
-        2 => &name,
-        3 => &name[0..=0],
-        _ => &name[2..=3],
-    };
-    let third_part = match len {
-        0 => unreachable!(),
-        1 => None,
-        2 => None,
-        3 => Some(&name),
-        _ => Some(&name),
-    };
-
-    let mut result = format!("https://index.crates.io/{}/{}", first_part, second_part);
-    if let Some(third_part) = third_part {
-        result.push('/');
-        result.push_str(*third_part);
-    }
-
-    result
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CrateInfo {
-    pub vers: String,
-    pub cksum: String,
-    pub yanked: bool,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_sprase_index_url() {
-        assert_eq!(sprase_index_url("a"), "https://index.crates.io/1/a");
-        assert_eq!(
-            sprase_index_url("anyhow"),
-            "https://index.crates.io/an/yh/anyhow"
-        );
+    fn version(&self) -> &str {
+        &self.info.vers
     }
 }
